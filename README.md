@@ -96,6 +96,11 @@ an optimisation, not a requirement.
 - `up` turns on IPv4 and IPv6 forwarding, and sets `accept_ra=2` on the
   uplink if it was 1, so an SLAAC uplink keeps its default route. `down`
   leaves forwarding as it is.
+- Run a recent fips on the exit. A route through older nodes carries less
+  than 1280 bytes; the exit's fips then has to split its packets for that
+  route, which older versions do not do.
+- A phone can be an exit too: fips2go has an opt-in "Be an exit node for
+  others" mode with its own client list. It needs none of this repository.
 - Other Linux fips nodes can be clients with the kernel's `ip6tnl`
   (`mode any`, `encaplimit none`, remote = the exit's fips address; the
   commands are in `test/netns.sh`). A kernel client cannot send a non-TCP
