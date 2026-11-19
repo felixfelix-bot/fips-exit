@@ -14,17 +14,20 @@ Transport only. A client's packet becomes the payload of a mesh packet to
 the exit, with next-header 4 (IPv4) or 41 (IPv6) — plain IP-in-IPv6,
 RFC 2473. There is no tunnel header and no second encryption: fips already
 encrypts and authenticates every packet end to end, and the outer source
-address *is* the client's identity. On the exit this is the kernel's own
-`ip6tnl`, so no daemon runs here; `fips-exit` only configures the kernel:
+address *is* the client's identity.
 
-- one `ip6tnl` device per client (`fx` + 12 hex digits of its address),
-  which is also the allow-list: no device, no traffic;
-- NAT (masquerade) to the uplink for both families;
-- an nftables table that binds each device to its client's two inner
-  addresses, lets clients reach the internet only (not this host, its other
-  networks, or each other), and clamps the TCP MSS;
-- a routing rule so that replies to a client's IPv6 traffic go back into its
-  tunnel.
+Two parts run on the exit:
+
+- **`fips-exitd`**, a small daemon (Rust, one dependency): raw sockets for
+  the two next-header values on the mesh side, one TUN device
+  (`fipsexit0`) on the other. It admits a packet only from a listed client
+  and only when its inner source is that client's own address, and sends a
+  reply to the client its destination belongs to. The client list is the
+  allow-list: no entry, no traffic.
+- **`fips-exit`**, a script: the client list, the routes to the TUN, NAT
+  (masquerade) to the uplink for both families, and an nftables table that
+  lets clients reach the internet only — not this host, its other networks,
+  or each other — and clamps the TCP MSS.
 
 Addresses inside the tunnel need no negotiation. A client's IPv6 source is
 its fips address (`fd…`). Its IPv4 source is `10.` followed by the three
@@ -33,13 +36,11 @@ refuses a client whose derived address clashes with an existing one.
 
 ## Install
 
-Needs: a running fips with its TUN (`fips0`), Python 3, iproute2 (`ip`,
-`tc`), nftables, and a kernel with `ip6_tunnel`, `cls_u32`, `act_pedit` and
-`act_csum` (every mainstream distribution).
+Needs: a running fips with its TUN (`fips0`), Python 3, iproute2, nftables,
+and a Rust toolchain to build the daemon.
 
 ```sh
-sudo install -m 755 fips-exit /usr/local/sbin/fips-exit
-sudo install -m 644 fips-exit.service /etc/systemd/system/
+./install.sh
 sudo systemctl enable --now fips-exit
 ```
 
@@ -49,14 +50,14 @@ sudo systemctl enable --now fips-exit
 sudo fips-exit add npub1…  alice-phone   # allow a client (npub or fd… address)
 sudo fips-exit list
 sudo fips-exit remove alice-phone
-sudo fips-exit status                    # devices and their packet counters
-sudo fips-exit down                      # remove everything this script made
+sudo fips-exit status
 ```
 
-The client list is `/etc/fips-exit/clients`; `up` rebuilds everything from
-it, so it is safe to run again at any time. `/etc/fips-exit/config` takes
-`WAN=<interface>` (default: the interface of the default route) and
-`MESH_IF=<interface>` (default `fips0`).
+Changes apply at once; the daemon re-reads the list on SIGHUP, which the
+script sends. The list is `/etc/fips-exit/clients`. `/etc/fips-exit/config`
+takes `WAN=<interface>` (default: the interface of the default route),
+`MESH_IF=<interface>` (default `fips0`) and `TUN=<name>` (default
+`fipsexit0`).
 
 On the client, enter this node's npub as the exit node. A direct fips link
 between client and exit (add the exit as a peer) keeps latency down; it is
@@ -65,49 +66,50 @@ not required.
 ## Packet sizes
 
 A mesh packet is at most 1280 bytes at fips's default transport MTU, so 1240
-bytes are left for the inner packet.
+bytes are left for the inner packet, while the tunnel's own MTU is 1280 —
+the least IPv6 allows.
 
-| Traffic | What happens |
-| --- | --- |
-| TCP, both families | MSS clamped in both directions (1200 / 1180); never larger than 1240. |
-| Client → internet, up to 1280 bytes | The client sends two fragments of the *outer* packet; the kernel here reassembles them. |
-| Internet → client, IPv4, up to 1280 bytes | Fragmented as IPv4 by this host and reassembled by the client. For that, DF is cleared on IPv4/UDP arriving on the uplink (a `tc` filter). |
-| Internet → client, IPv6, 1241–1280 bytes, not TCP | **Lost.** Linux does not fragment the outer packet of an `ip6tnl` tunnel, and IPv6 has no in-path fragmentation. |
+- TCP is kept to one mesh packet by its MSS, clamped in both directions
+  (1200 for IPv4, 1180 for IPv6).
+- Anything else between 1241 and 1280 bytes (QUIC, mostly) travels as two
+  fragments of the *outer* packet, in both directions and both families:
+  RFC 2473 section 7.1. The kernel does the fragmenting and the reassembly
+  on the daemon's sockets.
 
-The last row is mostly QUIC over IPv6: such a connection stalls or falls
-back to TCP. Two ways out, neither in this version:
-
-- carry 1320-byte mesh packets between client and exit (a fips transport
-  MTU of about 1400 and a matching `tun.mtu` on both ends, over a direct
-  link), after which nothing is fragmented at all;
-- a small daemon here in place of the kernel tunnel, which fragments the
-  outer packet as the client already does — and is also where a carrier
-  over fips's native datagram API would live.
+This is why there is a daemon at all: Linux's own `ip6tnl` does not
+fragment the outer packet, so a kernel-only exit loses exactly those IPv6
+packets, and QUIC over IPv6 stalls. Raising fips's transport MTU to about
+1400 on both ends of a direct link avoids the fragments altogether; that is
+an optimisation, not a requirement.
 
 ## What the operator and the client should know
 
 - The exit sees its clients' internet traffic as any VPN endpoint does, and
   the internet sees the exit's address.
-- fips2go's DNS proxy does not use the exit yet: lookups leave from the
-  phone's own connection.
 - `fips-exit` adds its own nftables table and opens two firewalls it knows:
   fips's own (a drop-in `fips.d/fips-exit.nft` admitting next-header 4, 41
   and 44 from the clients' addresses; `FIPS_FIREWALL=` in the config to
   leave it alone) and ufw (runtime rules in its before-chains, tagged
   `fips-exit`; `ufw reload` drops them and `fips-exit up` restores them).
   Any other host firewall that drops by default must allow that input on
-  the mesh interface and forwarding for `fx*` devices itself.
+  the mesh interface and forwarding for the TUN device itself.
 - `up` turns on IPv4 and IPv6 forwarding, and sets `accept_ra=2` on the
   uplink if it was 1, so an SLAAC uplink keeps its default route. `down`
   leaves forwarding as it is.
+- Other Linux fips nodes can be clients with the kernel's `ip6tnl`
+  (`mode any`, `encaplimit none`, remote = the exit's fips address; the
+  commands are in `test/netns.sh`). A kernel client cannot send a non-TCP
+  IPv6 packet over 1240 bytes, for the reason above.
 
 ## Test
 
 ```sh
-unshare -Urnm test/netns.sh
+cargo test                      # the daemon's admission and routing rules
+cargo build --release && unshare -Urnm test/netns.sh
 ```
 
-Runs without root and without fips: network namespaces stand in for two
-clients, the exit and the internet, and a 1280-byte link stands in for the
-mesh. It checks both families, NAT, the size cases above, TCP, the binding
-of a client to its addresses, isolation, removal and teardown.
+The second runs the daemon and the script against the real kernel, without
+root and without fips: network namespaces stand in for two clients, the
+exit and the internet, and a 1280-byte link stands in for the mesh. It
+checks both families, NAT, full-size packets in both directions, TCP, the
+binding of a client to its addresses, isolation, removal and teardown.

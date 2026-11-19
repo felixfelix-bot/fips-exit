@@ -8,7 +8,8 @@
 #   client c2 ─┘
 #
 # The clients use the kernel's own ip6tnl, i.e. the same wire format the
-# phone speaks. Run as: unshare -Urnm test/netns.sh
+# phone speaks. Needs the daemon built (cargo build --release).
+# Run as: unshare -Urnm test/netns.sh
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 export FIPS_EXIT_DIR=$(mktemp -d)
@@ -39,6 +40,22 @@ ip -n inet -6 addr add 2001:db8:1::2/64 dev eth0 nodad
 # No route back to anything but the exit's own uplink addresses: a reply
 # only arrives if the exit masqueraded.
 
+# Turn off transmit checksum offload on a device. Between namespaces a veth
+# leaves checksums unfilled, which nothing notices while the kernel carries
+# the packet end to end; here the daemon receives the tunnelled packet as
+# bytes, as it does from a real mesh, and those bytes must be complete.
+no_offload() { # netns device...
+  ns=$1; shift
+  ip netns exec "$ns" python3 -c '
+import array, fcntl, socket, struct, sys
+s = socket.socket()
+for dev in sys.argv[1:]:
+    for command in (0x17, 0x19, 0x1f):  # ETHTOOL_STXCSUM, _SSG, _STSO
+        value = array.array("B", struct.pack("II", command, 0))
+        try: fcntl.ioctl(s, 0x8946, struct.pack("16sP", dev.encode(), value.buffer_info()[0]))
+        except OSError: pass' "$@"
+}
+
 client() { # name address ipv4
   ip netns add "$1"
   ip link add "v$1" type veth peer name fips0 netns "$1"
@@ -52,10 +69,20 @@ client() { # name address ipv4
   ip -n "$1" addr add "$3/32" dev tun0
   ip -n "$1" route add default dev tun0
   ip -n "$1" -6 route add default dev tun0 src "$2"
+  no_offload "$1" fips0 tun0
 }
 client c1 $C1 $C1V4
 client c2 $C2 $C2V4
 printf "WAN=wan\nFIPS_FIREWALL=\n" > "$FIPS_EXIT_DIR/config"
+daemon="$here/target/release/fips-exitd"
+[ -x "$daemon" ] || fail "build the daemon first: cargo build --release"
+
+# --- without the daemon, the script says so and applies nothing ----------------
+"$here/fips-exit" up 2>&1 | grep -q "fips-exitd is not running" || fail "up without the daemon"
+ok "up without the daemon is refused"
+"$daemon" --clients "$FIPS_EXIT_DIR/clients" --mesh-if fips0 --tun fipsexit0 2>"$FIPS_EXIT_DIR/daemon.log" &
+for i in 1 2 3 4 5 6 7 8 9 10; do ip link show fipsexit0 >/dev/null 2>&1 && break; sleep 0.2; done
+ip link show fipsexit0 >/dev/null 2>&1 || fail "the daemon did not create its TUN: $(cat "$FIPS_EXIT_DIR/daemon.log")"
 
 # A server that answers a request "<n>" with n bytes, DF set on IPv4: what a
 # QUIC server does to a client that sent a small packet.
@@ -91,7 +118,7 @@ else: print("timeout")' "$2" "$3" "$4"
 ok "no client entry, no traffic"
 
 "$here/fips-exit" add $C1 phone-one >/dev/null
-"$here/fips-exit" list | grep -q "$C1  $C1V4  fx112233445566  phone-one" || fail "list: $("$here/fips-exit" list)"
+"$here/fips-exit" list | grep -q "$C1  $C1V4  phone-one" || fail "list: $("$here/fips-exit" list)"
 ok "client added: $("$here/fips-exit" list)"
 
 # --- both families, masqueraded -----------------------------------------------
@@ -101,14 +128,13 @@ grep -qx 203.0.113.1 "$FIPS_EXIT_DIR/peers" || fail "IPv4 not masqueraded: $(cat
 grep -qx 2001:db8:1::1 "$FIPS_EXIT_DIR/peers" || fail "IPv6 not masqueraded: $(cat "$FIPS_EXIT_DIR/peers")"
 ok "IPv4 and IPv6 reach the internet from the exit's addresses"
 
-# --- large packets towards the client -----------------------------------------
-# IPv4, 1280 bytes with DF set (payload 1252): fragmented as IPv4 by the exit.
+# --- full-size packets towards the client --------------------------------------
+# 1280 bytes is the tunnel's MTU: IPv4 payload 1252 (DF set, as QUIC does),
+# IPv6 payload 1232. Neither fits one mesh packet beside the outer header, so
+# the exit sends two fragments of the outer packet and the client reassembles.
 [ "$(ask c1 4 203.0.113.2 1252)" = 1252 ] || fail "1280-byte IPv4 packet (DF) towards the client"
-ok "a 1280-byte IPv4 packet with DF arrives (fragmented by the exit)"
-# IPv6: 1240 bytes (payload 1192) is the most the kernel's tunnel carries
-# over a 1280-byte mesh. See README, "Packet sizes".
-[ "$(ask c1 6 2001:db8:1::2 1192)" = 1192 ] || fail "1240-byte IPv6 packet towards the client"
-ok "a 1240-byte IPv6 packet arrives"
+[ "$(ask c1 6 2001:db8:1::2 1232)" = 1232 ] || fail "1280-byte IPv6 packet towards the client"
+ok "1280-byte packets arrive in both families (outer fragments)"
 
 # --- a 1280-byte IPv6 packet from the client ----------------------------------
 # The phone sends it as two fragments of the OUTER packet; the exit's kernel
@@ -176,7 +202,8 @@ ok "the exit host and other clients are not reachable through the tunnel"
 [ "$(ask c2 4 203.0.113.2 100)" = 100 ] || fail "remaining client broke on removal"
 ok "removing a client cuts it off and leaves the others"
 "$here/fips-exit" down >/dev/null
-ip link show type ip6tnl | grep -q fx && fail "devices left after down"
+ip route show dev fipsexit0 | grep -q . && fail "routes left after down"
+ip -6 rule show | grep -q "lookup 5170" && fail "rule left after down"
 nft list table inet fips_exit >/dev/null 2>&1 && fail "table left after down"
 ok "down removes everything"
 echo PASS

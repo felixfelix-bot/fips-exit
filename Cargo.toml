@@ -1,0 +1,14 @@
+[package]
+name = "fips-exitd"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Exit-node daemon for fips: carries clients' IP packets between the mesh and a TUN device"
+publish = false
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+strip = true
+lto = true

@@ -4,17 +4,18 @@
 Clients (fips2go, or any fips node) send their internet traffic to this node
 as plain IP-in-IPv6 over the mesh (RFC 2473: next-header 4 for IPv4, 41 for
 IPv6, no tunnel header, no encryption of its own - fips encrypts end to
-end). This script builds the kernel side: one ip6tnl device per client, NAT
-to the uplink, and a firewall that binds each client to its own addresses.
+end). The daemon fips-exitd moves those packets between the mesh and a TUN
+device; this script is everything around it: the client list, the routes,
+NAT to the uplink, and the firewall.
 
   fips-exit add <npub|fd-address> [name]   allow a client (and apply)
   fips-exit remove <npub|fd-address|name>  remove a client (and apply)
   fips-exit list                           the clients and their addresses
-  fips-exit up                             build everything from the client list
+  fips-exit up                             apply the client list (needs fips-exitd running)
   fips-exit down                           remove everything this script made
   fips-exit status                         what is in place right now
 
-Needs root, iproute2 (ip and tc), nftables, and a running fips with its TUN (fips0).
+Needs root, iproute2, nftables, and fips-exitd (systemctl start fips-exit).
 """
 
 import hashlib
@@ -31,13 +32,11 @@ CONFIG = os.path.join(DIR, "config")
 TABLE = "fips_exit"  # nftables table (inet)
 ROUTE_TABLE = "5170"  # per-client IPv6 return routes
 RULE_PRIORITY = "5170"
-TC_PREF = "5170"  # the DF-clearing filter on the uplink
-PREFIX = "fx"  # tunnel device names: fx + 12 hex digits of the client address
 MESH = ipaddress.ip_network("fd00::/8")
 
 # A mesh packet is at most 1280 bytes, so an inner packet beside the 40-byte
-# outer header is at most 1240. TCP is clamped to fit; the rest is handled
-# per family, see up().
+# outer header travels whole up to 1240 and as two fragments above that. TCP
+# is kept whole by its MSS.
 INNER_WHOLE = 1240
 MSS4 = INNER_WHOLE - 40
 MSS6 = INNER_WHOLE - 60
@@ -111,10 +110,6 @@ def inner_ipv4(address):
     return ipaddress.IPv4Address(b"\x0a" + address.packed[1:4])
 
 
-def device(address):
-    return PREFIX + address.packed[1:7].hex()
-
-
 # --- state -------------------------------------------------------------------
 
 
@@ -143,9 +138,10 @@ def save_clients(clients):
 
 
 def load_config():
-    # FIPS_FIREWALL: fips's own nftables file (default-deny input on its
-    # TUN); empty = leave it alone.
-    config = {"MESH_IF": "fips0", "WAN": "", "FIPS_FIREWALL": "/etc/fips/fips.nft"}
+    # TUN: the daemon's device. FIPS_FIREWALL: fips's own nftables file
+    # (default-deny input on its TUN); empty = leave it alone.
+    config = {"MESH_IF": "fips0", "WAN": "", "TUN": "fipsexit0",
+              "FIPS_FIREWALL": "/etc/fips/fips.nft"}
     try:
         for line in open(CONFIG):
             key, _, value = line.split("#")[0].partition("=")
@@ -179,9 +175,23 @@ def mesh_address(config):
     die(f"{config['MESH_IF']} has no fips address")
 
 
-def existing_devices():
+def tun_present(config):
+    return run("ip", "link", "show", "dev", config["TUN"], check=False).returncode == 0
+
+
+def remove_kernel_tunnels(config):
+    """Undo what versions before the daemon set up: one ip6tnl device per
+    client (fx…) and a DF-clearing tc filter on the uplink."""
     links = json.loads(run("ip", "-j", "link", "show", "type", "ip6tnl").stdout or "[]")
-    return [l["ifname"] for l in links if l["ifname"].startswith(PREFIX)]
+    for link in links:
+        if link["ifname"].startswith("fx"):
+            run("ip", "link", "del", link["ifname"])
+    wan = config["WAN"] or None
+    if wan is None:
+        routes = json.loads(run("ip", "-j", "route", "show", "default").stdout or "[]")
+        wan = next((r["dev"] for r in routes if r.get("dev")), None)
+    if wan:
+        run("tc", "filter", "del", "dev", wan, "ingress", "pref", "5170", check=False)
 
 
 # --- up / down ---------------------------------------------------------------
@@ -196,33 +206,35 @@ def sysctl(key, value):
         die(f"sysctl {key}={value}: {error}")
 
 
-def ruleset(clients, wan):
+def ruleset(clients, config, wan):
     """The whole nftables table, replaced in one transaction."""
-    set4 = ", ".join(f'"{device(a)}" . {inner_ipv4(a)}' for a, _ in clients)
-    set6 = ", ".join(f'"{device(a)}" . {a}' for a, _ in clients)
+    tun, mesh = config["TUN"], config["MESH_IF"]
+    set4 = ", ".join(str(inner_ipv4(a)) for a, _ in clients)
+    set6 = ", ".join(str(a) for a, _ in clients)
     return f"""
 table inet {TABLE}
 delete table inet {TABLE}
 table inet {TABLE} {{
-    # Which inner source address each tunnel device may use: a client can
-    # only ever send as itself.
+    # The clients' inner addresses. The daemon already admits a packet only
+    # from the client its source address belongs to; this is the same list
+    # for the rules below.
     set clients4 {{
-        type ifname . ipv4_addr
+        type ipv4_addr
         {"elements = { " + set4 + " }" if set4 else ""}
     }}
     set clients6 {{
-        type ifname . ipv6_addr
+        type ipv6_addr
         {"elements = { " + set6 + " }" if set6 else ""}
     }}
 
     chain forward {{
         type filter hook forward priority filter; policy accept;
-        iifname "{PREFIX}*" jump from_client
-        oifname "{PREFIX}*" jump to_client
+        iifname "{tun}" jump from_client
+        oifname "{tun}" jump to_client
     }}
     chain from_client {{
-        meta nfproto ipv4 iifname . ip saddr != @clients4 drop
-        meta nfproto ipv6 iifname . ip6 saddr != @clients6 drop
+        meta nfproto ipv4 ip saddr != @clients4 drop
+        meta nfproto ipv6 ip6 saddr != @clients6 drop
         # The internet only: not this host's other networks, not each other.
         oifname != "{wan}" drop
         meta nfproto ipv4 tcp flags syn tcp option maxseg size > {MSS4} tcp option maxseg size set {MSS4}
@@ -235,38 +247,24 @@ table inet {TABLE} {{
         meta nfproto ipv6 tcp flags syn tcp option maxseg size > {MSS6} tcp option maxseg size set {MSS6}
         accept
     }}
-    # Nothing on this host is reachable through a client's tunnel.
+    # Nothing on this host is reachable through the tunnel.
     chain input {{
         type filter hook input priority filter; policy accept;
-        iifname "{PREFIX}*" drop
+        iifname "{tun}" drop
+    }}
+    # With the kernel's own tunnel module loaded, the kernel answers every
+    # tunnel packet the daemon has just taken with "port unreachable",
+    # because no kernel tunnel matches it. Those go nowhere.
+    chain output {{
+        type filter hook output priority filter; policy accept;
+        oifname "{mesh}" ip6 daddr @clients6 icmpv6 type destination-unreachable icmpv6 code port-unreachable drop
     }}
     chain nat {{
         type nat hook postrouting priority srcnat; policy accept;
-        iifname "{PREFIX}*" oifname "{wan}" masquerade
+        iifname "{tun}" oifname "{wan}" masquerade
     }}
 }}
 """
-
-
-def clear_df(wan, on):
-    """Clear the DF bit of IPv4/UDP packets arriving on the uplink.
-
-    The kernel's tunnel refuses an inner IPv4 packet over 1240 bytes, and a
-    client's route says so; with DF set the forwarding path then answers the
-    internet server with "fragmentation needed", which QUIC servers do not
-    act on - the download stalls. With DF clear it fragments the packet (as
-    IPv4) and the client reassembles. It has to happen before the routing
-    decision and nftables may not rewrite headers in every environment, so
-    this is a tc filter. UDP only: TCP is kept small by its MSS, and for a
-    packet this host receives itself the bit means nothing.
-    """
-    run("tc", "filter", "del", "dev", wan, "ingress", "pref", TC_PREF, check=False)
-    if not on:
-        return
-    run("tc", "qdisc", "add", "dev", wan, "clsact", check=False)  # may exist already
-    run("tc", "filter", "add", "dev", wan, "ingress", "pref", TC_PREF, "protocol", "ip",
-        "u32", "match", "ip", "protocol", "17", "0xff", "match", "u16", "0x4000", "0x4000", "at", "6",
-        "action", "pedit", "ex", "munge", "ip", "df", "clear", "pipe", "action", "csum", "ip")
 
 
 UFW_TAG = "fips-exit"
@@ -301,13 +299,13 @@ def fips_firewall(clients, config, on):
 
 
 def ufw(clients, config, on):
-    """Let the tunnels through ufw, when ufw is what filters this host.
+    """Let the tunnel through ufw, when ufw is what filters this host.
 
     ufw drops input and forwarding by default and has no syntax for
     "protocol 4 over IPv6", so the rules go straight into its before-chains.
     They are runtime rules: `ufw reload` drops them and `fips-exit up` puts
-    them back. Forwarding is opened for the tunnel devices as a whole; what
-    a client may actually do is decided in our own table.
+    them back. Forwarding is opened for the TUN device as a whole; what a
+    client may actually do is decided in our own table.
     """
     def rules(tool, chain):
         listed = run(tool, "-S", chain, check=False)
@@ -320,7 +318,7 @@ def ufw(clients, config, on):
         ],
     }
     for tool, chain in (("iptables", "ufw-before-forward"), ("ip6tables", "ufw6-before-forward")):
-        wanted[(tool, chain)] = [["-i", PREFIX + "+", "-j", "ACCEPT"], ["-o", PREFIX + "+", "-j", "ACCEPT"]]
+        wanted[(tool, chain)] = [["-i", config["TUN"], "-j", "ACCEPT"], ["-o", config["TUN"], "-j", "ACCEPT"]]
     for (tool, chain), specs in wanted.items():
         existing = rules(tool, chain)
         if existing is None:
@@ -337,7 +335,9 @@ def cmd_up():
     config = load_config()
     clients = load_clients()
     wan = uplink(config)
-    local = mesh_address(config)
+    tun = config["TUN"]
+    if not tun_present(config):
+        die(f"no interface {tun}: fips-exitd is not running (systemctl start fips-exit)")
 
     sysctl("net.ipv4.ip_forward", "1")
     sysctl("net.ipv6.conf.all.forwarding", "1")
@@ -347,55 +347,43 @@ def cmd_up():
     if os.path.exists(accept_ra) and open(accept_ra).read().strip() == "1":
         sysctl(f"net.ipv6.conf.{wan}.accept_ra", "2")
 
-    wanted = {device(a) for a, _ in clients}
-    for name in existing_devices():
-        if name not in wanted:
-            run("ip", "link", "del", name)
-    have = set(existing_devices())
-
-    run("nft", "-f", "-", stdin=ruleset(clients, wan))
-    clear_df(wan, True)
+    remove_kernel_tunnels(config)
+    run("nft", "-f", "-", stdin=ruleset(clients, config, wan))
     fips_firewall(clients, config, True)
     ufw(clients, config, True)
 
     # Replies to a client's IPv6 traffic are addressed to its fips address,
     # which the main table routes into the mesh as it is. Forwarded packets
-    # (never this host's own) look here first and find the tunnel.
+    # (never this host's own, so not the daemon's) look here first and find
+    # the tunnel.
     run("ip", "-6", "rule", "del", "priority", RULE_PRIORITY, check=False)
     run("ip", "-6", "rule", "add", "not", "iif", "lo", "to", str(MESH),
         "lookup", ROUTE_TABLE, "priority", RULE_PRIORITY)
     run("ip", "-6", "route", "flush", "table", ROUTE_TABLE, check=False)
-
+    wanted4 = {str(inner_ipv4(a)) for a, _ in clients}
+    for route in json.loads(run("ip", "-j", "route", "show", "dev", tun).stdout or "[]"):
+        if route["dst"] not in wanted4:
+            run("ip", "route", "del", route["dst"], "dev", tun)
     for address, _ in clients:
-        name = device(address)
-        if name in have:
-            run("ip", "link", "del", name)  # the local address may have changed
-        # encaplimit none: no destination-options header between the outer
-        # header and the packet, which is what the clients send and expect.
-        run("ip", "link", "add", name, "type", "ip6tnl", "mode", "any",
-            "local", str(local), "remote", str(address),
-            "encaplimit", "none", "hoplimit", "64")
-        run("ip", "link", "set", name, "mtu", "1280", "up")
-        # IPv4: the kernel's tunnel refuses an inner IPv4 packet over 1240
-        # bytes outright, so the route says 1240 and the forwarding path
-        # fragments (see clear_df). IPv6 up to 1280 passes, and the tunnel
-        # fragments the outer packet (RFC 2473 section 7.1).
-        run("ip", "route", "replace", str(inner_ipv4(address)), "dev", name, "mtu", str(INNER_WHOLE))
-        run("ip", "-6", "route", "replace", str(address), "dev", name, "table", ROUTE_TABLE)
+        run("ip", "route", "replace", str(inner_ipv4(address)), "dev", tun)
+        run("ip", "-6", "route", "replace", str(address), "dev", tun, "table", ROUTE_TABLE)
 
-    print(f"fips-exit: up, {len(clients)} client(s), uplink {wan}, mesh address {local}")
+    # The daemon re-reads the client list on SIGHUP.
+    run("pkill", "-HUP", "-x", "fips-exitd", check=False)
+    print(f"fips-exit: up, {len(clients)} client(s), uplink {wan}, tunnel {tun}")
 
 
 def cmd_down():
-    for name in existing_devices():
-        run("ip", "link", "del", name)
+    config = load_config()
+    remove_kernel_tunnels(config)
     run("nft", "delete", "table", "inet", TABLE, check=False)
-    clear_df(uplink(load_config()), False)
-    fips_firewall([], load_config(), False)
-    ufw([], load_config(), False)
+    fips_firewall([], config, False)
+    ufw([], config, False)
     run("ip", "-6", "rule", "del", "priority", RULE_PRIORITY, check=False)
     run("ip", "-6", "route", "flush", "table", ROUTE_TABLE, check=False)
-    print("fips-exit: down (IP forwarding left as it is)")
+    if tun_present(config):
+        run("ip", "route", "flush", "dev", config["TUN"], check=False)
+    print("fips-exit: down (IP forwarding left as it is; the daemon is stopped by its service)")
 
 
 def cmd_add(who, name=""):
@@ -405,12 +393,12 @@ def cmd_add(who, name=""):
         if other == address:
             die(f"{address} is already a client")
         # 24 bits of the address: a clash is unlikely, and must not pass.
-        if inner_ipv4(other) == inner_ipv4(address) or device(other) == device(address):
+        if inner_ipv4(other) == inner_ipv4(address):
             die(f"{address} clashes with client {other} {other_name} (same derived IPv4 address)")
     clients.append((address, name))
     save_clients(clients)
-    print(f"added {address} (IPv4 {inner_ipv4(address)}, device {device(address)})")
-    cmd_up()
+    print(f"added {address} (IPv4 {inner_ipv4(address)})")
+    apply()
 
 
 def cmd_remove(who):
@@ -422,22 +410,36 @@ def cmd_remove(who):
     if len(keep) == len(clients):
         die(f"{who} is not a client")
     save_clients(keep)
-    cmd_up()
+    apply()
 
 
 def cmd_list():
     for address, name in load_clients():
-        print(f"{address}  {inner_ipv4(address)}  {device(address)}  {name}")
+        print(f"{address}  {inner_ipv4(address)}  {name}".rstrip())
+
+
+def apply():
+    """After a change to the list: apply it now if the daemon runs, and say
+    so if it does not (the list is saved either way)."""
+    if tun_present(load_config()):
+        cmd_up()
+    else:
+        print("fips-exit: saved; fips-exitd is not running, so nothing was applied "
+              "(systemctl start fips-exit)")
 
 
 def cmd_status():
-    devices = existing_devices()
-    print(f"tunnel devices: {' '.join(devices) or 'none'}")
+    config = load_config()
+    daemon = run("pgrep", "-x", "fips-exitd", check=False).returncode == 0
+    print("daemon fips-exitd: " + ("running" if daemon else "not running"))
     table = run("nft", "list", "table", "inet", TABLE, check=False)
     print("nftables table: " + ("present" if table.returncode == 0 else "absent"))
-    for name in devices:
-        stats = json.loads(run("ip", "-j", "-s", "link", "show", name).stdout)[0]["stats64"]
-        print(f"  {name}: rx {stats['rx']['packets']} packets, tx {stats['tx']['packets']} packets")
+    if tun_present(config):
+        stats = json.loads(run("ip", "-j", "-s", "link", "show", config["TUN"]).stdout)[0]["stats64"]
+        # The TUN's point of view: what it receives came from the clients.
+        print(f"{config['TUN']}: {stats['rx']['packets']} packets from clients, "
+              f"{stats['tx']['packets']} to clients")
+    print(f"clients: {len(load_clients())}")
 
 
 def main(argv):

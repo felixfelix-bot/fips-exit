@@ -1,16 +1,18 @@
 [Unit]
-Description=fips exit node (IP-in-IPv6 tunnels, NAT and firewall for mesh clients)
+Description=fips exit node (carries mesh clients' internet traffic)
 After=fips.service network-online.target
 Wants=network-online.target
 Requires=fips.service
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-# fips0 and its address appear a moment after the daemon starts.
-ExecStartPre=/bin/sh -c 'for i in $(seq 30); do ip -6 addr show dev fips0 2>/dev/null | grep -q "inet6 fd" && exit 0; sleep 1; done; exit 1'
-ExecStart=/usr/local/sbin/fips-exit up
-ExecStop=/usr/local/sbin/fips-exit down
+# The daemon moves packets between the mesh and its TUN device (it waits for
+# fips's interface by itself); fips-exit then applies routes, NAT and the
+# firewall for the clients in /etc/fips-exit/clients.
+ExecStart=/usr/local/sbin/fips-exitd
+ExecStartPost=/bin/sh -c 'for i in $(seq 80); do ip link show fipsexit0 >/dev/null 2>&1 && exec /usr/local/sbin/fips-exit up; sleep 0.5; done; exit 1'
+ExecStopPost=/usr/local/sbin/fips-exit down
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
