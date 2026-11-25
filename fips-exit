@@ -105,9 +105,13 @@ def parse_client(text):
 
 
 def inner_ipv4(address):
-    """The client's IPv4 address inside the tunnel: 10. and the three bytes
-    after the fd of its fips address. The client derives the same value."""
-    return ipaddress.IPv4Address(b"\x0a" + address.packed[1:4])
+    """The client's IPv4 address inside the tunnel: 100.64.0.0/10 with the
+    low 22 bits of the three bytes after the fd of its fips address. The
+    client derives the same value; fips-exitd (src/main.rs) and fips2go
+    (shim/src/exit.rs) must agree with this, byte for byte."""
+    a = address.packed
+    bits = (a[1] << 16 | a[2] << 8 | a[3]) & 0x3FFFFF
+    return ipaddress.IPv4Address(0x64400000 | bits)
 
 
 # --- state -------------------------------------------------------------------
@@ -125,6 +129,27 @@ def load_clients():
         if fields:
             clients.append((ipaddress.IPv6Address(fields[0]), " ".join(fields[1:])))
     return clients
+
+
+def served(clients, warn=True):
+    """The clients the exit serves: the list, without any whose derived IPv4
+    address an earlier line already has. `add` never writes such a line; a
+    list edited by hand can hold one, and the daemon skips it the same way
+    (the first keeps the address), so the routes and the firewall must not
+    be built for it either."""
+    out, by_inner = [], {}
+    for address, name in clients:
+        inner = inner_ipv4(address)
+        other = by_inner.get(inner)
+        if other is not None and other != address:
+            if warn:
+                print(f"fips-exit: {address} {name} has the same IPv4 address ({inner}) as "
+                      f"{other}; not served. Remove one of them.", file=sys.stderr)
+            continue
+        if other is None:
+            by_inner[inner] = address
+            out.append((address, name))
+    return out
 
 
 def save_clients(clients):
@@ -333,7 +358,7 @@ def ufw(clients, config, on):
 
 def cmd_up():
     config = load_config()
-    clients = load_clients()
+    clients = served(load_clients())
     wan = uplink(config)
     tun = config["TUN"]
     if not tun_present(config):
@@ -392,7 +417,7 @@ def cmd_add(who, name=""):
     for other, other_name in clients:
         if other == address:
             die(f"{address} is already a client")
-        # 24 bits of the address: a clash is unlikely, and must not pass.
+        # 22 bits of the address: a clash is unlikely, and must not pass.
         if inner_ipv4(other) == inner_ipv4(address):
             die(f"{address} clashes with client {other} {other_name} (same derived IPv4 address)")
     clients.append((address, name))
@@ -414,8 +439,11 @@ def cmd_remove(who):
 
 
 def cmd_list():
-    for address, name in load_clients():
-        print(f"{address}  {inner_ipv4(address)}  {name}".rstrip())
+    clients = load_clients()
+    serving = {address for address, _ in served(clients, warn=False)}
+    for address, name in clients:
+        note = "" if address in serving else "  (not served: its IPv4 address is taken)"
+        print(f"{address}  {inner_ipv4(address)}  {name}".rstrip() + note)
 
 
 def apply():
