@@ -309,6 +309,38 @@ fn write_report(path: &Path, json: &str) -> io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// How often the report thread wakes. A minute unless
+/// `USAGE_REPORT_INTERVAL_MS` overrides it, which the test harness uses to
+/// see the report without waiting for the minute. A value of zero would make
+/// the loop spin and a value that is not a number is no interval at all, so
+/// both keep the default; the default is what an unset variable means.
+fn report_interval(setting: Option<&str>) -> Duration {
+    const DEFAULT: Duration = Duration::from_secs(60);
+    let Some(text) = setting else { return DEFAULT };
+    let text = text.trim();
+    match text.parse::<u64>() {
+        Ok(ms) if ms > 0 => match u32::try_from(ms) {
+            Ok(ms) => Duration::from_millis(u64::from(ms)),
+            Err(_) => {
+                eprintln!(
+                    "fips-exitd: USAGE_REPORT_INTERVAL_MS={text} is out of range; \
+                     reporting every {}s",
+                    DEFAULT.as_secs()
+                );
+                DEFAULT
+            }
+        },
+        _ => {
+            eprintln!(
+                "fips-exitd: USAGE_REPORT_INTERVAL_MS={text:?} is not a positive number of \
+                 milliseconds; reporting every {}s",
+                DEFAULT.as_secs()
+            );
+            DEFAULT
+        }
+    }
+}
+
 /// Which way a packet crossed the exit.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Direction {
@@ -780,8 +812,9 @@ fn run() -> Result<(), String> {
         std::thread::spawn(move || {
             let mut last = (0, 0, 0, 0, 0, 0, 0);
             let mut last_usage = String::new();
+            let interval = report_interval(std::env::var("USAGE_REPORT_INTERVAL_MS").ok().as_deref());
             loop {
-                std::thread::sleep(Duration::from_secs(60));
+                std::thread::sleep(interval);
                 state.reload_if_asked();
                 if let Some(path) = std::env::var_os("USAGE_REPORT") {
                     let json = state.usage.to_json();
@@ -886,6 +919,25 @@ mod tests {
             )
         );
         assert_eq!(Usage::default().to_json(), "[]");
+    }
+
+    /// The report interval is a minute unless `USAGE_REPORT_INTERVAL_MS` says
+    /// otherwise, and a value that is not a positive number of milliseconds is
+    /// not allowed to turn the loop into a spin: it falls back to the minute.
+    #[test]
+    fn the_report_interval_is_a_minute_unless_overridden_with_a_real_number() {
+        let minute = Duration::from_secs(60);
+        assert_eq!(report_interval(None), minute);
+        assert_eq!(report_interval(Some("200")), Duration::from_millis(200));
+        assert_eq!(report_interval(Some(" 2500 ")), Duration::from_millis(2500));
+        // Zero would busy-loop the report thread; not a number, not a duration.
+        assert_eq!(report_interval(Some("0")), minute);
+        assert_eq!(report_interval(Some("")), minute);
+        assert_eq!(report_interval(Some("-5")), minute);
+        assert_eq!(report_interval(Some("soon")), minute);
+        assert_eq!(report_interval(Some("1.5")), minute);
+        // A number too large for a Duration is a bad value too, not a panic.
+        assert_eq!(report_interval(Some("999999999999999999999")), minute);
     }
 
     #[test]
